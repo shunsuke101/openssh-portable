@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-keygen.c,v 1.492 2026/06/30 23:55:32 djm Exp $ */
+/* $OpenBSD: ssh-keygen.c,v 1.490 2026/03/03 09:57:25 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1994 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -39,6 +39,7 @@
 #include <limits.h>
 #include <locale.h>
 #include <time.h>
+#include <stdbool.h>
 
 #include "xmalloc.h"
 #include "sshkey.h"
@@ -62,6 +63,20 @@
 #include "ssh-sk.h"
 #include "sk-api.h" /* XXX for SSH_SK_USER_PRESENCE_REQD; remove */
 #include "cipher.h"
+
+/*tpm2-tools headerfile add*/
+#include "files.h"                          
+#include "log.h"                                                 
+#include "tpm2_alg_util.h"                                  
+#include "tpm2_convert.h"                                
+#include "tpm2_openssl.h"                                        
+#include "tpm2_tool_output.h"                                     
+#include "tpm2_eventlog.h"
+#include "tpm2_util.h"                                       
+
+/*tss2 headerfile add*/
+#include <tss2/tss2_common.h>
+#include <tss2/tss2_mu.h>
 
 #ifdef ENABLE_PKCS11
 #include "ssh-pkcs11.h"
@@ -171,8 +186,205 @@ int prime_test(FILE *, FILE *, uint32_t, uint32_t, char *, unsigned long,
     unsigned long);
 #endif
 
-static void
-type_bits_valid(int type, const char *name, uint32_t *bitsp)
+/*TPM structure*/
+typedef struct tpm2_verifysig_ctx tpm2_verifysig_ctx;
+struct tpm2_verifysig_ctx {
+    TPMI_ALG_HASH halg;
+    TPM2B_DIGEST msg_hash;
+    TPM2B_DIGEST pcr_hash;
+    TPMS_ATTEST attest;
+    TPM2B_DATA extra_data;
+    TPM2B_MAX_BUFFER signature;
+    tpm2_convert_pcrs_output_fmt pcrs_format;
+};
+
+static tpm2_verifysig_ctx ctx = {
+    .halg       = TPM2_ALG_SHA256,
+    .msg_hash   = TPM2B_TYPE_INIT(TPM2B_DIGEST, buffer),
+    .pcr_hash   = TPM2B_TYPE_INIT(TPM2B_DIGEST, buffer),
+    .pcrs_format = pcrs_output_format_serialized,
+};
+
+#define N_PADDING 3
+static const int rsaPadding[N_PADDING] = {
+    -1,                  
+    RSA_PKCS1_PADDING,
+    RSA_PKCS1_PSS_PADDING
+};
+/*tpm2_checkquote.c内の内部関数、message_from_fileを参考に、fileから、データを取得したくないので、
+　fileから取得する部分を変えて、certificateから取得したデータをそのまま構造体に代入できるようにする
+　
+*/
+static tool_rc message_from_cert(unsigned char *msg_cert,unsigned long size) 
+{
+    	tool_rc return_value = tool_rc_general_error;
+    	TPM2B_ATTEST *msg = (TPM2B_ATTEST *)calloc(1, sizeof(TPM2B_ATTEST) + size);
+    	if (!msg) {
+        	goto err;
+   	}
+
+    	msg->size = size;
+    	memcpy(msg->attestationData,msg_cert,size);
+    	if (!(size)) {
+        	goto err;
+    	}
+	tool_rc tmp_rc = files_tpm2b_attest_to_tpms_attest(msg,&ctx.attest);
+    	if (tmp_rc != tool_rc_success) {
+        	return_value = tmp_rc;
+        	goto err;
+   	 }
+
+    	bool res = tpm2_openssl_hash_compute_data(ctx.halg,msg->attestationData, msg->size,&ctx.msg_hash);
+    	if (!res) {
+        	goto err;
+    	}
+    	return_value = tool_rc_success;
+
+	err:
+    		free(msg);
+    		return return_value;
+}
+
+/*
+この関数は、tpm2-tools/lib/tpm2_convert.cのtpm2_convert_sig_load_plain()関数から、tpm2-tools/lib/file.cのtpm2_load_sig_slint()を見て、pathを使わない設計で、fread()でファイルのデータを取得しているのだが、これをやめて、certificateから来た、dataをtpm2のstructureに合わせたい。
+*/
+
+static tool_rc signature_from_cert(unsigned char *sig_cert,unsigned long size)
+{
+    	/*
+     	* TSS signature need be read and converted to plain
+     	*
+     	* So load it up into the TPMT Structure
+     	*/
+    	tool_rc return_value = tool_rc_general_error;
+	TPMI_ALG_HASH expected_halg = TPM2_ALG_ERROR;
+    	TPMT_SIGNATURE tmp = { 0 };
+	size_t offset = 0;
+    	UINT8 *buffer;
+	UINT16 size_u16=(UINT16)size;
+       
+        TSS2_RC rc = Tss2_MU_TPMT_SIGNATURE_Unmarshal(sig_cert,size_u16, &offset, &tmp); 
+     
+	if (rc != TSS2_RC_SUCCESS) {
+        	/* plain signatures are just used as is */
+        	expected_halg = TPM2_ALG_NULL;
+
+        	ctx.signature.size = sizeof(ctx.signature.buffer);
+        	/*return files_load_bytes_from_path(path, ctx.signature->buffer, &ctx.signature->size);*/
+    	}
+    	expected_halg = tmp.signature.any.hashAlg;
+
+    	/* Then convert it to plain, but into a buffer */
+
+    	buffer = tpm2_convert_sig(&(size_u16), &tmp);
+    	if (buffer == NULL) {
+        	return tool_rc_general_error;
+    	}
+
+    	if (size_u16 > sizeof(ctx.signature.buffer)) {
+        	free(buffer);
+        	return tool_rc_general_error;
+    	}
+
+   	ctx.signature.size = size_u16;
+    	memcpy(ctx.signature.buffer, buffer, size_u16);
+    	free(buffer);
+
+    	return tool_rc_success;
+}
+
+/*
+この関数は、tpm2-tools/lib/tpm2_convert.cのtpm2_util_bin_form_hex_or_file()関数から、pathを使わない設計で、fread()でファイルのデータを取得しているのだが、これをやめて、certificateから来た、dataをtpm2のstructureに合わせたい。
+*/ 
+
+static tool_rc nonce_from_cert(unsigned char *nonce_cert,unsigned long size)
+{
+	memcpy(ctx.extra_data.buffer,nonce_cert,size);
+	ctx.extra_data.size=(UINT16)size;
+	return tool_rc_success;
+            
+}
+
+static bool verify(FILE *fp)
+{
+	bool result = false;
+    	EVP_PKEY_CTX *pkey_ctx = NULL;
+    	int rc;
+
+    	EVP_PKEY *pkey = NULL;
+    	bool ret = tpm2_public_load_pkey("/home/ubuntu/.ssh/certificate_ak.pub", &pkey);
+    	if (!ret) {
+        	return false;
+    	}
+    	fprintf(fp,"sig:");
+	for(int i=0;i<ctx.signature.size;i++){
+		fprintf(fp,"%02X",ctx.signature.buffer[i]);
+	}
+	fprintf(fp,"\n");
+
+    	for (int i = 0; i < N_PADDING; i++) {
+        	pkey_ctx = EVP_PKEY_CTX_new(pkey, NULL);
+        	if (!pkey_ctx) {
+		    	fprintf(fp,"EVP_PKEY_CTX_new failed");	
+            		goto err;
+        	}
+
+        	const EVP_MD *md = tpm2_openssl_md_from_tpmhalg(ctx.halg);
+        	if (!md) {
+			fprintf(fp,"Algorithm not support %X",ctx.halg);
+            		goto err;
+        	}
+
+        	rc = EVP_PKEY_verify_init(pkey_ctx);
+        	if (!rc) {
+			fprintf(fp,"EVP_PKEY_verify_init faid");
+            		goto err;
+        	}
+
+        	rc = EVP_PKEY_CTX_set_signature_md(pkey_ctx, md);
+        	if (!rc) {
+			fprintf(fp,"EVP_PKEY_CTX_set_signature_md faided");
+            		goto err;
+       	 	}
+
+        	if (rsaPadding[i] != -1) {
+            		rc = EVP_PKEY_CTX_set_rsa_padding(pkey_ctx, rsaPadding[i]);
+            		if (rc < 0) {
+				fprintf(fp,"EVP_PKEY_CTX_set_rsa_padding");
+                		goto err;
+            		}
+        	}
+
+        	rc = EVP_PKEY_verify(pkey_ctx, ctx.signature.buffer, ctx.signature.size, ctx.msg_hash.buffer,  ctx.msg_hash.size);
+        	if (rc == 1) {
+            		break;
+        	} else {
+            		EVP_PKEY_CTX_free(pkey_ctx);
+            		pkey_ctx = NULL;
+       	 	}
+ 	}
+
+    	/* nonce*/
+    	if (ctx.attest.extraData.size != ctx.extra_data.size ||
+            memcmp(ctx.attest.extraData.buffer, ctx.extra_data.buffer, ctx.extra_data.size) != 0) {
+        	fprintf(fp,"Error validating nonce from quote");
+		goto err;
+    	}
+    	/* magic*/
+    	if (ctx.attest.magic != TPM2_GENERATED_VALUE) {
+		fprintf(fp,"Bad magic gpt");        	
+		return false;
+    	}
+
+    	result = true;
+
+	err:
+    		EVP_PKEY_free(pkey);
+    		EVP_PKEY_CTX_free(pkey_ctx);
+    		return result;
+}
+
+static void type_bits_valid(int type, const char *name, uint32_t *bitsp)
 {
 	if (type == KEY_UNSPEC)
 		fatal("unknown key type %s", key_type_name);
@@ -241,8 +453,7 @@ confirm_overwrite(const char *filename)
 	return 1;
 }
 
-static void
-ask_filename(struct passwd *pw, const char *prompt)
+static void ask_filename(struct passwd *pw, const char *prompt)
 {
 	char buf[1024];
 	char *name = NULL;
@@ -272,10 +483,6 @@ ask_filename(struct passwd *pw, const char *prompt)
 		case KEY_ED25519_SK:
 		case KEY_ED25519_SK_CERT:
 			name = _PATH_SSH_CLIENT_ID_ED25519_SK;
-			break;
-		case KEY_MLDSA44_ED25519:
-		case KEY_MLDSA44_ED25519_CERT:
-			name = _PATH_SSH_CLIENT_ID_MLDSA44_ED25519;
 			break;
 		default:
 			fatal("bad key type");
@@ -1019,10 +1226,6 @@ do_gen_all_hostkeys(struct passwd *pw)
 #endif /* OPENSSL_HAS_ECC */
 #endif /* WITH_OPENSSL */
 		{ "ed25519", "ED25519",_PATH_HOST_ED25519_KEY_FILE },
-#ifdef USE_MLDSA
-		{ "mldsa44-ed25519", "MLDSA44-ED25519",
-		     _PATH_HOST_MLDSA44_ED25519_KEY_FILE },
-#endif
 		{ NULL, NULL, NULL }
 	};
 
@@ -2027,13 +2230,21 @@ add_cert_option(char *opt)
 	} else
 		fatal("Unsupported certificate option \"%s\"", opt);
 }
-
-static void
-show_options(struct sshbuf *optbuf, int in_critical)
+/*ここを変えた
+strcmpで判断したときに、tpm2_checkquote.c/init()の関数群を動かす設計にする
+quote_msg:message_from_file(),files_tpm2b_attest_to_tpms_attest(),tpm2_openssl_compute_data()
+qoute_sig:tpm2_convert_sig_load_plain()
+nonce:ctx.extra_data.size,tpm2_util_bin_from_hex_or_file()
+message_hashをどうするか
+*/
+static void show_options(struct sshbuf *optbuf, int in_critical)
 {
-	char *name, *arg, *hex;
+	char *name, *arg, *hex, *value;
 	struct sshbuf *options, *option = NULL;
 	int r;
+	u_char buf[BUFSIZ]; /*decode buffer*/
+	FILE *fp; /*file*/
+	unsigned long msg_len,sig_len,nonce_len,pcrs_len; /*decode*/
 
 	if ((options = sshbuf_fromb(optbuf)) == NULL)
 		fatal_f("sshbuf_fromb failed");
@@ -2059,16 +2270,56 @@ show_options(struct sshbuf *optbuf, int in_critical)
 				fatal_fr(r, "parse critical");
 			printf(" %s\n", arg);
 			free(arg);
-		} else if (in_critical &&
-		    strcmp(name, "verify-required") == 0) {
+		} else if (in_critical && strcmp(name, "verify-required") == 0) {
 			printf("\n");
 		} else if (sshbuf_len(option) > 0) {
 			hex = sshbuf_dtob16(option);
-			printf(" UNKNOWN OPTION: %s (len %zu)\n",
-			    hex, sshbuf_len(option));
+			size_t hex_len=sshbuf_len(option);
+			if ((r = sshbuf_get_cstring(option, &value, NULL)) != 0 )
+				fatal_fr(r,"parse option");
+			if(strcmp(name,"quote_msg.b64")==0){
+				msg_len=b64_pton(value,buf,sizeof(buf));
+				message_from_cert(buf,msg_len);	
+			}else if(strcmp(name,"quote_sig.b64")==0){
+				sig_len=b64_pton(value,buf,sizeof(buf));
+				signature_from_cert(buf,sig_len);
+			}else if(strcmp(name,"nonce_bin.b64")==0){
+				nonce_len=b64_pton(value,buf,sizeof(buf));
+				nonce_from_cert(buf,nonce_len);
+			}else if(strcmp(name,"quote_pcrs.b64")==0){
+				pcrs_len=b64_pton(value,buf,sizeof(buf));
+				fp=fopen("/home/ubuntu/test/cert_pcrs/certificate_quote.pcrs","wb");
+				fwrite(buf,1,pcrs_len,fp);
+				fclose(fp);
+			}
+			if(ctx.msg_hash.size&&ctx.signature.size&&ctx.extra_data.size){
+				char comfirm[BUFSIZ]="success input struct ctx data"; 
+				fp=fopen("/home/ubuntu/openssh-portable/conform.txt","w");
+				fprintf(fp,"success input struct\n");
+				fprintf(fp,"ctx.msg_hash.size %d\n",ctx.msg_hash.size);
+				for(int i=0;i<ctx.msg_hash.size;i++)
+					fprintf(fp,"%02X",ctx.msg_hash.buffer[i]);
+				fprintf(fp,"\n");
+				fprintf(fp,"ctx.signature.size %d\n",ctx.signature.size);
+				for(int i=0;i<ctx.signature.size;i++)
+					fprintf(fp,"%02X",ctx.signature.buffer[i]);
+				fprintf(fp,"\n");
+				fprintf(fp,"ctx.extra_data.size %d\n",ctx.extra_data.size);
+				for(int i=0;i<ctx.extra_data.size;i++)
+					fprintf(fp,"%02X",ctx.extra_data.buffer[i]);
+				fprintf(fp,"\n");
+				bool res=verify(fp);
+					if(res==true){
+						fprintf(fp,"Verify OK\n");
+					}else{
+						fprintf(fp,"Verify signature faied\n");
+					}	
+				fclose(fp);				
+			}
+			printf(" UNKNOWN OPTION: %s (len %zu)\n",hex,hex_len);
 			sshbuf_reset(option);
 			free(hex);
-		} else
+		}else
 			printf(" UNKNOWN FLAG OPTION\n");
 		free(name);
 		if (sshbuf_len(option) != 0)
@@ -2077,9 +2328,11 @@ show_options(struct sshbuf *optbuf, int in_critical)
 	sshbuf_free(option);
 	sshbuf_free(options);
 }
-
-static void
-print_cert(struct sshkey *key)
+/*show_options(key->cert->extension)
+ *
+ * 
+*/
+static void print_cert(struct sshkey *key)
 {
 	char valid[64], *key_fp, *ca_fp;
 	u_int i;
@@ -2124,9 +2377,11 @@ print_cert(struct sshkey *key)
 		show_options(key->cert->extensions, 0);
 	}
 }
-
-static void
-do_show_cert(struct passwd *pw)
+/*
+ * print_cert(sturct *sshkey):2072
+ *
+ * */
+static void do_show_cert(struct passwd *pw)
 {
 	struct sshkey *key = NULL;
 	struct stat st;
@@ -3247,7 +3502,7 @@ usage(void)
 	fprintf(stderr,
 	    "usage: ssh-keygen [-q] [-a rounds] [-b bits] [-C comment] [-f output_keyfile]\n"
 	    "                  [-m format] [-N new_passphrase] [-O option]\n"
-	    "                  [-t ecdsa|ecdsa-sk|ed25519|ed25519-sk|mldsa44-ed25519|rsa]\n"
+	    "                  [-t ecdsa | ecdsa-sk | ed25519 | ed25519-sk | rsa]\n"
 	    "                  [-w provider] [-Z cipher]\n"
 	    "       ssh-keygen -p [-a rounds] [-f keyfile] [-m format] [-N new_passphrase]\n"
 	    "                   [-P old_passphrase] [-Z cipher]\n"
