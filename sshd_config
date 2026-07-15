@@ -15,9 +15,9 @@
 #ListenAddress 0.0.0.0
 #ListenAddress ::
 
-#HostKey /usr/local/etc/ssh/ssh_host_rsa_key
-#HostKey /usr/local/etc/ssh/ssh_host_ecdsa_key
-#HostKey /usr/local/etc/ssh/ssh_host_ed25519_key
+#HostKey /etc/ssh/ssh_host_rsa_key
+#HostKey /etc/ssh/ssh_host_ecdsa_key
+#HostKey /etc/ssh/ssh_host_ed25519_key
 
 # Ciphers and keying
 #RekeyLimit default none
@@ -116,3 +116,4 @@ Subsystem	sftp	/usr/libexec/sftp-server
 #	AllowTcpForwarding no
 #	PermitTTY no
 #	ForceCommand cvs server
+TrustedUserCAKeys /etc/ssh/ca.key.pub
