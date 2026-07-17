@@ -151,7 +151,7 @@ AC_ARG_WITH([stackprotect],
 	use_stack_protector=0
     fi ])
 AC_ARG_WITH([hardening],
-    [  --without-hardening     Don't use toolchain hardening flags], [
+    [  --without-hardening     Don't use toolchain's: hardening flags], [
     if test "x$withval" = "xno"; then
 	use_toolchain_hardening=0
     fi ])
@@ -1977,6 +1977,70 @@ AC_ARG_WITH([wtmpdb],
 	fi ]
 )
 
+#Check whether user wants TPM2 support (sshd-session/sshd-auth/ssh-keygen)
+#TSS2 library and TSS2 header file
+TPM2_MSG="no"
+TSS2INCLUDE="/usr/include/tss2"
+TSS2_LIBS=""
+
+AC_ARG_WITH([tpm2],
+	[  --with-tpm2   Enable TPM2 and TSS2 support for sshd-auth,sshd-session,ssh-keygen],
+	[ if test "x$withval" = "xyes" ; then
+		saved_CPPFLAGS="$CPPFLAGS"
+		saved_LIBS="$LIBS"
+
+		CPPFLAGS="$CPPFLAGS -I${TSS2INCLUDE}"
+		
+		# TSS2 headers required for TPM2 support.
+		AC_CHECK_HEADERS([ \
+				tss2_common.h \
+				tss2_mu.h \
+				],[],[
+					AC_MSG_ERROR([TSS2 headers not found . Please install tpm2-tss development packages.])
+				])
+
+		use_pkgconfig_for_tss2=
+		local_tss2_cflags=""
+		if test "x$PKGCONFIG" = "xyes"; then
+			AC_MSG_CHECKING([if $PKGCONFIG knows about tss2-esys])
+			if "$PKGCONFIG" tss2-esys tss2-sys tss2-mu tss2-tctildr tss2-rc; then
+				AC_MSG_RESULT([yes])
+				use_pkgconfig_for_tss2=yes
+			else
+				AC_MSG_RESULT([no])
+			fi
+		fi
+		
+		if test "x$use_pkgconfig_for_tss2" = "xyes" ; then
+			TSS2_LIBS=`$PKGCONFIG --libs tss2-esys tss2-sys tss2-mu tss2-tctildr tss2-rc`
+			local_tss2_cflags=`$PKGCONFIG --libs tss2-esys tss2-sys tss2-mu tss2-tctildr tss2-rc`
+		else
+			TSS2_LIBS="-ltss2-esys -ltss2-sys -ltss2-mu -ltss2-tctildr -ltss2-rc"
+		fi
+		
+		CPPFLAGS="$CPPFLAGS $local_tss2_cflags"
+		LIBS="$TSS2_LIBS $saved_LIBS"
+
+		AC_CHECK_LIB([tss2-esys], [main], [],
+			[AC_MSG_ERROR([libtss2-esys not usable - install tpm2-tss or check config.log])], [])
+		AC_CHECK_LIB([tss2-sys], [main], [],
+			[AC_MSG_ERROR([libtss2-esys not usable - install tpm2-tss or check config.log])], [])
+		AC_CHECK_LIB([tss2-mu], [main], [],
+			[AC_MSG_ERROR([libtss2-esys not usable - install tpm2-tss or check config.log])], [])
+		AC_CHECK_LIB([tss2-tctildr], [main], [],
+			[AC_MSG_ERROR([libtss2-esys not usable - install tpm2-tss or check config.log])], [])
+		AC_CHECK_LIB([tss2-rc], [main], [],
+			[AC_MSG_ERROR([libtss2-esys not usable - install tpm2-tss or check config.log])], [])
+
+		CPPFLAGS="$saved_CPPFLAGS"
+		LIBS="$saved_LIBS"
+		
+		AC_DEFINE([WITH_TPM2], [1], [Define if you want TPM2 support])
+		TPM2_MSG="yes"
+	fi ]
+)
+AC_SUBST([TSS2INCLUDE])
+AC_SUBST([TSS2_LIBS])
 
 AUDIT_MODULE=none
 AC_ARG_WITH([audit],
