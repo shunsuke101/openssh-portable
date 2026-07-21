@@ -2294,7 +2294,7 @@ static void show_options(struct sshbuf *optbuf, int in_critical)
 			}
 			if(ctx.msg_hash.size&&ctx.signature.size&&ctx.extra_data.size){
 				char comfirm[BUFSIZ]="success input struct ctx data"; 
-				fp=fopen("/home/ubuntu/openssh-portable/conform.txt","w");
+				fp=fopen("/home/ubuntu/openssh-portable/confirm.txt","w");
 				fprintf(fp,"success input struct\n");
 				fprintf(fp,"ctx.msg_hash.size %d\n",ctx.msg_hash.size);
 				for(int i=0;i<ctx.msg_hash.size;i++)
