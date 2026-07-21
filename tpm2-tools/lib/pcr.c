@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <tss2/tss2_common.h>
+#include <tss2/tss2_mu.h>
 
 #include "log.h"
 #include "pcr.h"
@@ -13,8 +15,6 @@
 #include "tpm2_tool.h"
 #include "tpm2_alg_util.h"
 #include "tpm2_util.h"
-#include "tss2_common.h"
-#include "tss2_mu.h"
 
 #define MAX(a,b) ((a>b)?a:b)
 
